@@ -104,36 +104,49 @@ class ResCompany(models.Model):
             company = self.env.company
         else:
             company = valid_certificate[:1].company_id if valid_certificate else False
+            
         if not company:
             _logger.log(25, "No pudimos encontrar compañía con certificados de AFIP validos")
             return False
+            
         env_company = self.env.company
         self.env.company = company
-        for currency in available_currencies:
-            try:
-                # Obtain the currencies to be updated
-                _logger.log(25, "Connecting to AFIP to update the currency rates for %s", currency.name)
+        
+        try:
+            for currency in available_currencies:
+                try:
+                    # Obtain the currencies to be updated
+                    _logger.log(25, "Connecting to AFIP to update the currency rates for %s", currency.name)
 
-                # Do not pass company since we need to find the one that has certificate
-                afip_date, rate = currency._l10n_ar_get_afip_ws_currency_rate()
-                afip_date = datetime.strptime(afip_date, "%Y%m%d").date() + relativedelta(days=1)
-                if afip_date == rate_date or self.env.context.get("l10n_ar_force_create_rate"):
-                    res.update({currency.name: (1.0 / rate, rate_date)})
-                    _logger.log(25, "Currency %s %s %s", currency.name, rate_date, rate)
+                    # Do not pass company since we need to find the one that has certificate
+                    afip_date_str, rate = currency._l10n_ar_get_afip_ws_currency_rate()
+                    ws_date = datetime.strptime(afip_date_str, "%Y%m%d").date()
+                    
+                    # Tolerancia de 1 a 5 días para cubrir misma fecha, fines de semana y feriados largos
+                    delta_days = (rate_date - ws_date).days
+                    is_valid_date = 1 <= delta_days <= 5
+
+                    if is_valid_date or self.env.context.get("l10n_ar_force_create_rate"):
+                        res.update({currency.name: (1.0 / rate, rate_date)})
+                        _logger.log(25, "Currency %s %s %s (WS date: %s)", currency.name, rate_date, rate, ws_date)
+                    else:
+                        raise UserError(
+                            "Tasa AFIP demasiado antigua o inconsistente. "
+                            "Fecha WS: %s (%s), Fecha esperada: %s (%s). Diferencia: %s días."
+                            % (ws_date, ws_date.strftime("%A"), rate_date, rate_date.strftime("%A"), delta_days)
+                        )
+                except Exception as e:
+                    _logger.log(25, "Could not get rate for currency %s. This is what we get:\n%s", currency.name, e)
                 else:
-                    raise UserError(
-                        "Returned Afip rate is not today's rate (%s, %s vs %s, %s)"
-                        % (afip_date.strftime("%A"), afip_date, rate_date.strftime("%A"), rate_date)
-                    )
-                self.env.company = env_company
-            except Exception as e:
-                self.env.company = env_company
-                _logger.log(25, "Could not get rate for currency %s. This is what we get:\n%s", currency.name, e)
-            else:
-                for company in self.filtered(lambda x: x.currency_provider == "afip"):
-                    company.l10n_ar_last_currency_sync_date = fields.Date.context_today(
-                        self.with_context(tz="America/Argentina/Buenos_Aires")
-                    )
+                    for comp in self.filtered(lambda x: x.currency_provider == "afip"):
+                        # Escritura bajo el contexto de la propia compañía para evitar depender
+                        # de env_company o de la compañía con el certificado AFIP válido
+                        comp.with_company(comp).l10n_ar_last_currency_sync_date = fields.Date.context_today(
+                            self.with_context(tz="America/Argentina/Buenos_Aires")
+                        )
+        finally:
+            self.env.company = env_company
+            
         return res or False
 
     def _generate_currency_rates(self, parsed_data):
